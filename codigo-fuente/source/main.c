@@ -4,6 +4,7 @@
 #include "storage_error.h"
 #include "catalog.h"
 #include "titledata.h"
+#include "progress.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -65,10 +66,63 @@ static void finish_backup_log(void)
         snprintf(log_notice, sizeof log_notice, "No se pudo guardar el log en la microSD.");
 }
 
+/* ---- Interfaz ---------------------------------------------------------- */
+#define UI_RESET "\x1b[0m"
+#define UI_ACCENT "\x1b[36;1m"
+#define UI_DIM "\x1b[37m"
+#define UI_WARN "\x1b[33;1m"
+#define UI_DANGER "\x1b[31;1m"
+enum { UiWidth = 78, ListRows = 14 };
+
+static void ui_header(const char *section)
+{
+    printf("\x1b[46;30m  NovaSave2  " UI_RESET "\x1b[44;37;1m  %-61.61s  " UI_RESET "\n\n", section);
+}
+
+static void ui_row(bool selected, const char *format, ...)
+{
+    char text[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof text, format, args);
+    va_end(args);
+    if (selected)
+        printf("\x1b[30;46m > %-*.*s" UI_RESET "\n", UiWidth - 4, UiWidth - 4, text);
+    else
+        printf("   %-*.*s\n", UiWidth - 4, UiWidth - 4, text);
+}
+
+static void ui_key(const char *key, const char *label)
+{
+    printf("\x1b[30;47m %s " UI_RESET " %s   ", key, label);
+}
+
+static void ui_rule(void)
+{
+    printf(UI_DIM "  ");
+    for (int i = 0; i < UiWidth - 4; i++)
+        putchar('-');
+    printf(UI_RESET "\n");
+}
+
+static const char *status_color(void)
+{
+    static const char *bad[] = {"Fallo", "No se", "Cancelado", "PELIGRO", "Sin confirmar", "PARCIAL",
+                                "La consola no", "2002-", "Escritura confirmada. "};
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++)
+        if (!strncmp(status, bad[i], strlen(bad[i])))
+            return UI_DANGER;
+    if (strstr(status, "verificad") || strstr(status, "Desempaquetado") || strstr(status, "creado"))
+        return "\x1b[32;1m";
+    return UI_WARN;
+}
+
 static void show_message(const char *message)
 {
     consoleClear();
-    printf("\x1b[36;1mNovaSave2\x1b[0m\n\n%s\n", message);
+    ui_header("Trabajando");
+    printf("  " UI_ACCENT "%s" UI_RESET "\n\n  " UI_DIM "No apagues la consola ni saques la microSD." UI_RESET "\n",
+           message);
     consoleUpdate(NULL);
 }
 
@@ -494,21 +548,6 @@ static void load_backups(const SaveEntry *save)
         report("%zu respaldos en la microSD.", backup_count);
 }
 
-static void open_edits(const SaveEntry *save)
-{
-    load_backups(save);
-    for (size_t i = 0; i < backup_count; i++) {
-        if (backups[i].raw_folder) {
-            backup_index = i;
-            report("Selecciona una carpeta. ZR crea la copia, A la restaura.");
-            return;
-        }
-    }
-    report("No se encontraron carpetas con archivos sueltos para este juego.");
-    snprintf(detail, sizeof detail, "switch/NovaSave2/editados/%016" PRIX64 "/<nombre>/",
-             save->id.title);
-}
-
 static void select_created(const char *path)
 {
     load_backups(&saves[save_index]);
@@ -564,6 +603,7 @@ static void make_backup(const SaveEntry *save)
         return;
 
     Result result = 0;
+    progress_title("Respaldando la partida");
     bool ok = backup_save(save, path, &result);
     if (R_FAILED(result)) {
         report("No se pudo abrir la partida (0x%08" PRIX32 ").", (uint32_t)result);
@@ -589,6 +629,7 @@ static bool restore_mounted(const SaveEntry *save, FILE *input, SaveIdentity sou
         return false;
     }
     archive_set_relocation(true);
+    progress_title("Copia previa del perfil de destino");
     bool previous_ok = archive_backup(SAVE_ROOT, recovery, save->id);
     backup_log_event("COPIA PREVIA tramos=%u", archive_relocations());
     archive_set_relocation(false);
@@ -632,6 +673,7 @@ static bool restore_mounted(const SaveEntry *save, FILE *input, SaveIdentity sou
 static FILE *open_verified(const BackupEntry *backup)
 {
     backup_log_event("ABRIR NSV2 DE ORIGEN ruta=%s", backup->path);
+    progress_title("Comprobando el respaldo");
     FILE *file = fopen(backup->path, "rb");
     bool modified;
     if (!file || !archive_matches(file, backup->source, &modified) ||
@@ -642,7 +684,7 @@ static FILE *open_verified(const BackupEntry *backup)
         if (file)
             fclose(file);
         report("PELIGRO: respaldo danado, alterado o reemplazado.");
-        snprintf(detail, sizeof detail, "Usa archivos editados en editados/ e importalos con ZR.");
+        snprintf(detail, sizeof detail, "Usa archivos sueltos de editados/ desde Respaldos (X).");
         return NULL;
     }
     return file;
@@ -689,6 +731,7 @@ static void export_backup(const BackupEntry *backup)
         return;
     }
     snprintf(root, sizeof root, "%s/", folder);
+    progress_title("Desempaquetando archivos");
     if (archive_read(file, backup->source, root)) {
         select_created(folder);
         report("Desempaquetado: archivos sueltos en la microSD.");
@@ -742,11 +785,13 @@ static void prepare_for_profile(const SaveEntry *save, const BackupEntry *backup
         char root[BackupPathSize + 2];
         snprintf(root, sizeof root, "%s/", backup->path);
         backup_log_event("PREPARAR CARPETA EDITADA ruta=%s", root);
+        progress_title("Empaquetando la carpeta editada");
         ok = archive_backup_modified(root, path, save->id);
     } else {
         FILE *input = open_verified(backup);
         if (!input)
             return;
+        progress_title("Creando la copia para el perfil");
         ok = archive_copy_for_profile(input, backup->source, save->id, path);
         fclose(input);
     }
@@ -921,6 +966,7 @@ static void extend_journal(const SaveEntry *save, const JournalPlan *expected)
         return;
     }
     Result rc = 0;
+    progress_title("Copia previa antes de ampliar");
     bool saved = backup_save(save, recovery, &rc);
     if (R_FAILED(rc)) {
         report("No se pudo abrir el destino para respaldarlo (0x%08" PRIX32 ").", (uint32_t)rc);
@@ -951,6 +997,7 @@ static void verify_committed(const SaveEntry *save, FILE *input, SaveIdentity so
     char recovery[sizeof detail];
     snprintf(recovery, sizeof recovery, "%s", detail);
     archive_set_relocation(false);
+    progress_title("Releyendo lo guardado");
     Result result = fsdevMountSaveDataReadOnly("novasave", save->id.title, save->uid);
     bool matches = false;
     if (R_SUCCEEDED(result)) {
@@ -1021,120 +1068,186 @@ static size_t select_index(size_t selected, size_t count, u64 keys)
 
 static void draw_confirmation(const char *question)
 {
-    printf("%s  %s\nIzq/Der Elegir   A Confirmar   B Volver\n",
-           question, confirm_yes ? "No    [Si]" : "[No]    Si");
+    printf("\n  " UI_WARN "%s" UI_RESET "    ", question);
+    printf(confirm_yes ? "  No    \x1b[30;43m  Si  " UI_RESET "\n\n" : "\x1b[30;47m  No  " UI_RESET "    Si  \n\n");
+    printf("  ");
+    ui_key("<- ->", "Elegir");
+    ui_key("A", "Confirmar");
+    ui_key("B", "Volver");
+    printf("\n");
+}
+
+static void draw_profiles(void)
+{
+    ui_header(preparing_profile ? "Copia para otro perfil" : "Elegir perfil de destino");
+    printf("  " UI_ACCENT "%s" UI_RESET "\n\n", preparing_profile ? "Para que perfil sera la nueva copia?" :
+                                                                 "En que perfil se guardara la partida?");
+    for (size_t i = 0; i < profile_count; i++) {
+        const TargetProfile *profile = &profiles[i];
+        ui_row(i == profile_index, "%-36.36s  ...%08" PRIX32 "%s", profile->save.profile,
+               (uint32_t)profile->save.id.user_low, profile->has_save ? "" : "   [crear partida]");
+    }
+    printf("\n  ");
+    ui_key("A", "Elegir");
+    ui_key("B", "Volver");
+    printf("\n");
+}
+
+static void draw_backups(void)
+{
+    ui_header("Respaldos");
+    printf("  " UI_ACCENT "%.50s" UI_RESET "  /  %.24s\n", saves[save_index].title, saves[save_index].profile);
+    if (backup_count) {
+        const char *folder = backups[backup_index].folder;
+        char label[GameFolderSize];
+        copy_label(label, sizeof label, folder, strlen(folder));
+        printf("  " UI_DIM "Carpeta: %.66s" UI_RESET "\n", label[0] ? label : "backups");
+    }
+    printf("\n");
+    if (!backup_count)
+        printf("  " UI_DIM "Todavia no hay respaldos de esta partida. Pulsa B y luego A para crear uno." UI_RESET "\n");
+    size_t start = backup_index / ListRows * ListRows;
+    for (size_t i = start; i < backup_count && i < start + ListRows; i++) {
+        char label[BackupNameSize];
+        const BackupEntry *entry = &backups[i];
+        copy_label(label, sizeof label, entry->name, strlen(entry->name));
+        const char *tag = "";
+        if (entry->raw_folder)
+            tag = !strcmp(entry->folder, "editados") ? "[EDITADOS]" : "[CARPETA]";
+        else if (entry->modified)
+            tag = "[MODIFICADO]";
+        ui_row(i == backup_index, "%-58.58s %s", label, tag);
+    }
+    if (backup_count) {
+        char selected[BackupNameSize];
+        const char *name = backups[backup_index].name;
+        copy_label(selected, sizeof selected, name, strlen(name));
+        printf("\n");
+        ui_rule();
+        printf("  " UI_DIM "%zu de %zu" UI_RESET "   %.64s\n", backup_index + 1, backup_count, selected);
+    }
+    printf("\n");
+    if (pending == DeleteAction) {
+        printf("  " UI_DANGER "Se borrara este archivo de la microSD para siempre." UI_RESET "\n\n  ");
+        ui_key("A", "Borrar");
+        ui_key("B", "Cancelar");
+        printf("\n");
+    } else if (pending == PrepareAction) {
+        printf("  Crear una copia para " UI_ACCENT "%.36s" UI_RESET " en la microSD.\n"
+               "  " UI_DIM "El juego podria rechazar los datos al recuperarlos." UI_RESET "\n",
+               profiles[profile_index].save.profile);
+        draw_confirmation("Crear esta copia?");
+    } else if (pending == JournalAction) {
+        printf("  Ampliar el registro de " UI_ACCENT "%.36s" UI_RESET " en la memoria interna.\n"
+               "  Actual: %" PRIu64 " bytes    Nuevo: %" PRIu64 " bytes\n"
+               "  " UI_WARN "El aumento es permanente." UI_RESET " Antes se hara una copia previa.\n\n  ",
+               profiles[profile_index].save.profile, (uint64_t)journal_plan.current_journal,
+               (uint64_t)journal_plan.requested_journal);
+        ui_key("A", "Ampliar registro");
+        ui_key("B", "Cancelar");
+        printf("\n");
+    } else if (pending == RestoreAction || pending == StagedRestoreAction) {
+        const SaveEntry *target = &profiles[profile_index].save;
+        printf("  Destino: " UI_ACCENT "%.36s" UI_RESET "  ...%08" PRIX32 "%s\n", target->profile,
+               (uint32_t)target->id.user_low, pending == StagedRestoreAction ? "   [por etapas]" : "");
+        if (backups[backup_index].raw_folder || !same_user(target->id, backups[backup_index].source))
+            printf("  " UI_WARN "El juego podria rechazar datos importados o de otro perfil." UI_RESET "\n");
+        if (backups[backup_index].modified)
+            printf("  " UI_DANGER "Respaldo modificado: el juego podria rechazarlo o perder progreso." UI_RESET "\n");
+        if (!profiles[profile_index].has_save)
+            printf("  " UI_DIM "Se pedira crear la partida para este perfil si falta." UI_RESET "\n");
+        printf("  " UI_DIM "Antes de escribir se guarda una copia previa." UI_RESET "\n");
+        if (pending == StagedRestoreAction)
+            printf("  " UI_WARN "Si una etapa falla, pueden quedar cambios parciales." UI_RESET "\n");
+        else {
+            printf("\n  ");
+            ui_key("X", "Por etapas");
+            ui_key("Y", "Revisar registro");
+            printf("\n");
+        }
+        draw_confirmation("Restaurar esta copia?");
+    } else if (backup_count && backups[backup_index].raw_folder) {
+        printf("  ");
+        ui_key("A", "Restaurar carpeta");
+        ui_key("ZR", "Guardar copia NSV2");
+        ui_key("B", "Volver");
+        printf("\n");
+    } else if (backup_count) {
+        printf("  ");
+        ui_key("A", "Restaurar");
+        ui_key("Y", "Desempaquetar");
+        ui_key("ZR", "Copia para perfil");
+        printf("\n\n  ");
+        ui_key("X", "Borrar");
+        ui_key("B", "Volver");
+        printf("\n");
+    } else {
+        printf("  ");
+        ui_key("B", "Volver");
+        printf("\n");
+    }
+}
+
+static void draw_saves(void)
+{
+    ui_header("Partidas guardadas");
+    printf("  " UI_ACCENT "%-48s %s" UI_RESET "\n", "Juego", "Perfil");
+    ui_rule();
+    if (!save_count)
+        printf("  " UI_DIM "No hay partidas para mostrar. Pulsa Y para actualizar." UI_RESET "\n");
+    size_t start = save_index / ListRows * ListRows;
+    for (size_t i = start; i < save_count && i < start + ListRows; i++)
+        ui_row(i == save_index, "%-46.46s  %.26s", saves[i].title, saves[i].profile);
+    if (save_count) {
+        ui_rule();
+        printf("  " UI_DIM "%zu de %zu" UI_RESET "    ID %016" PRIX64 "    Usuario ...%08" PRIX32 "\n",
+               save_index + 1, save_count, saves[save_index].id.title,
+               (uint32_t)saves[save_index].id.user_low);
+    }
+    printf("\n");
+    if (pending == BackupAction) {
+        printf("  Respaldar " UI_ACCENT "%.40s" UI_RESET " / %.24s en la microSD.\n"
+               "  " UI_DIM "Si algo falla, el registro (.log) explica el motivo." UI_RESET "\n",
+               saves[save_index].title, saves[save_index].profile);
+        draw_confirmation("Crear este respaldo?");
+    } else {
+        printf("  ");
+        ui_key("A", "Respaldar");
+        ui_key("X", "Respaldos");
+        ui_key("Y", "Actualizar");
+        ui_key("+", "Salir");
+        printf("\n");
+    }
 }
 
 static void draw(bool browsing)
 {
     consoleClear();
-    printf("\x1b[36;1mNovaSave2\x1b[0m   Partidas guardadas\n\n");
-    if (pending == ProfileAction) {
-        printf("%s\n\n", preparing_profile ? "Crear copia NSV2 para un perfil" : "Selecciona el perfil de destino");
-        for (size_t i = 0; i < profile_count; i++) {
-            const TargetProfile *profile = &profiles[i];
-            printf("%s %.36s  (...%08" PRIX32 ")%s\n", i == profile_index ? ">" : " ",
-                   profile->save.profile, (uint32_t)profile->save.id.user_low,
-                   profile->has_save ? "" : "  [Crear partida]");
-        }
-        printf("\nA Elegir perfil   B Volver\n");
-    } else if (browsing) {
-        printf("%.60s  /  %.24s\n", saves[save_index].title, saves[save_index].profile);
-        if (backup_count) {
-            const char *folder = backups[backup_index].folder;
-            char label[GameFolderSize];
-            copy_label(label, sizeof label, folder, strlen(folder));
-            printf("Carpeta del juego en microSD: %.56s\n", label[0] ? label : "backups");
-        }
-        printf("\n");
-        size_t start = backup_index / 10 * 10;
-        for (size_t i = start; i < backup_count && i < start + 10; i++) {
-            char label[BackupNameSize];
-            copy_label(label, sizeof label, backups[i].name, strlen(backups[i].name));
-            const BackupEntry *entry = &backups[i];
-            const char *tag = "";
-            if (entry->raw_folder)
-                tag = !strcmp(entry->folder, "editados") ? "  [EDITADOS]" : "  [CARPETA]";
-            else if (entry->modified)
-                tag = "  [MODIFICADO]";
-            printf("%s  %.56s%s\n", i == backup_index ? ">" : " ", label, tag);
-        }
-        if (backup_count) {
-            char selected[BackupNameSize];
-            const char *name = backups[backup_index].name;
-            copy_label(selected, sizeof selected, name, strlen(name));
-            printf("\nArchivo seleccionado (%zu/%zu)\n%s\n",
-                   backup_index + 1, backup_count, selected);
-        }
-        if (pending == DeleteAction) {
-            printf("\n\x1b[31;1mBorrar permanentemente este archivo de la microSD.\x1b[0m\n"
-                   "A Borrar   B Cancelar\n");
-        } else if (pending == PrepareAction) {
-            printf("\nCrear copia para %.36s en la microSD.\n"
-                   "El juego podria rechazar los datos al recuperarlos.\n",
-                   profiles[profile_index].save.profile);
-            draw_confirmation("Crear esta copia?");
-        } else if (pending == JournalAction) {
-            printf("\nAumentar el registro de %.36s en la memoria interna.\n"
-                   "Actual: %" PRIu64 " bytes. Nuevo: %" PRIu64 " bytes.\n"
-                   "El aumento es permanente. Primero se hara una copia previa.\n"
-                   "A Ampliar registro   B Cancelar\n",
-                   profiles[profile_index].save.profile, (uint64_t)journal_plan.current_journal,
-                   (uint64_t)journal_plan.requested_journal);
-        } else if (pending == RestoreAction || pending == StagedRestoreAction) {
-            const SaveEntry *target = &profiles[profile_index].save;
-            printf("\nDestino: %.36s  (...%08" PRIX32 ")\n", target->profile,
-                   (uint32_t)target->id.user_low);
-            if (backups[backup_index].raw_folder ||
-                !same_user(target->id, backups[backup_index].source))
-                printf("El juego podria rechazar datos importados o de otro perfil.\n");
-            if (backups[backup_index].modified)
-                printf("\n\x1b[31;1mRespaldo modificado: se intentara guardar en el perfil elegido.\n"
-                       "El juego podria rechazar los datos o perder progreso.\x1b[0m\n");
-            if (!profiles[profile_index].has_save)
-                printf("Se pedira crear la partida para este perfil si falta.\n");
-            printf("\nSe guardara una copia previa antes de escribir.\n");
-            if (pending == StagedRestoreAction)
-                printf("Si una etapa falla, pueden quedar cambios parciales.\n");
-            else
-                printf("X Por etapas   Y Revisar registro\n");
-            draw_confirmation("Restaurar esta copia?");
-        } else if (backup_count && backups[backup_index].raw_folder) {
-            printf("\nA Restaurar carpeta   ZR Guardar copia NSV2   B Volver\n");
-        } else if (backup_count) {
-            printf("\nA Restaurar   Y Desempaquetar   ZR Crear copia para perfil\nX Borrar   B Volver\n");
-        } else {
-            printf("\nB Volver\n");
-        }
-    } else {
-        size_t start = save_index / 10 * 10;
-        for (size_t i = start; i < save_count && i < start + 10; i++)
-            printf("%s  %.46s   /   %.24s\n", i == save_index ? ">" : " ",
-                   saves[i].title, saves[i].profile);
-        if (save_count)
-            printf("\n%zu/%zu   ID %016" PRIX64 "   Usuario ...%08" PRIX32 "\n",
-                   save_index + 1, save_count, saves[save_index].id.title,
-                   (uint32_t)saves[save_index].id.user_low);
-        if (pending == BackupAction) {
-            printf("\nCrear respaldo en la microSD de %.46s / %.24s.\n"
-                   "Si la copia falla, abre el registro para ver el motivo.\n",
-                   saves[save_index].title, saves[save_index].profile);
-            draw_confirmation("Crear este respaldo?");
-        } else {
-            printf("\nA Respaldar   X Respaldos   Y Actualizar   ZR Abrir editados\n");
-        }
+    if (pending == ProfileAction)
+        draw_profiles();
+    else if (browsing)
+        draw_backups();
+    else
+        draw_saves();
+    if (status[0]) {
+        printf("\n  %s%.74s" UI_RESET "\n", status_color(), status);
+        if (strlen(status) > 74)
+            printf("  %s%.74s" UI_RESET "\n", status_color(), status + 74);
     }
-    printf("\n%s\n", status);
-    if (detail[0])
-        printf("%s\n", detail);
+    if (detail[0]) {
+        size_t length = strlen(detail);
+        for (size_t at = 0; at < length && at < 74 * 4; at += 74)
+            printf("  " UI_DIM "%.74s" UI_RESET "\n", detail + at);
+    }
     if (log_notice[0])
-        printf("%s\n", log_notice);
+        printf("  " UI_DIM "%.76s" UI_RESET "\n", log_notice);
     consoleUpdate(NULL);
 }
 
 int main(void)
 {
     consoleInit(NULL);
+    progress_enable(true);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
@@ -1283,9 +1396,6 @@ int main(void)
         } else if ((keys & HidNpadButton_A) && save_count) {
             pending = BackupAction;
             report("Confirma el juego y el perfil que quieres respaldar.");
-        } else if ((keys & HidNpadButton_ZR) && save_count) {
-            open_edits(&saves[save_index]);
-            browsing = true;
         } else {
             save_index = select_index(save_index, save_count, movement);
         }

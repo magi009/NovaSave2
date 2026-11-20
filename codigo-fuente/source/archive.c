@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "archive.h"
 #include "backup_log.h"
+#include "progress.h"
 #include "storage_error.h"
 #include <dirent.h>
 #include <errno.h>
@@ -58,6 +59,9 @@ typedef struct {
     FILE *file;
     Hash hash;
     bool has_file;
+    bool counting;          /* primera pasada: solo suma tamanos */
+    uint64_t count_bytes;
+    unsigned count_files;
     unsigned char buffer[BufferSize];
 } Archive;
 
@@ -110,14 +114,18 @@ static void header(unsigned char out[32], SaveIdentity id)
 
 static bool write_data(Archive *archive, const void *data, size_t size)
 {
+    if (archive->counting)
+        return true;
     return fwrite(data, 1, size, archive->file) == size &&
            hash_add(&archive->hash, data, size);
 }
 
 static bool read_data(Archive *archive, void *data, size_t size)
 {
-    return fread(data, 1, size, archive->file) == size &&
-           hash_add(&archive->hash, data, size);
+    if (fread(data, 1, size, archive->file) != size)
+        return false;
+    progress_add(size);
+    return hash_add(&archive->hash, data, size);
 }
 
 static bool make_path(char *out, const char *root, const char *relative)
@@ -328,6 +336,7 @@ static bool list_folder(const char *root, const char *relative, NameList *names,
 
 static bool copy_file_into(Archive *archive, const char *disk, const char *child, uint64_t remaining)
 {
+    progress_file(child, remaining);
     FILE *input = fopen(disk, "rb");
     if (input == NULL)
         return fail_output("abrir archivo de origen", child, errno);
@@ -342,6 +351,7 @@ static bool copy_file_into(Archive *archive, const char *disk, const char *child
         if (ok) {
             remaining -= chunk;
             offset += chunk;
+            progress_add(chunk);
         }
     }
     if (ok && (fgetc(input) != EOF || ferror(input)))
@@ -386,7 +396,8 @@ static bool write_tree(Archive *archive, const char *root, const char *relative)
         } else {
             bool folder = S_ISDIR(info.st_mode);
             uint64_t size = folder ? 0 : (uint64_t)info.st_size;
-            backup_log_entry(folder ? "CARPETA" : "COPIAR ARCHIVO", child, size);
+            if (!archive->counting)
+                backup_log_entry(folder ? "CARPETA" : "COPIAR ARCHIVO", child, size);
             unsigned char record[11] = {folder ? Directory : RegularFile};
             encode(record + 1, (unsigned)length, 2);
             encode(record + 3, size, 8);
@@ -395,7 +406,12 @@ static bool write_tree(Archive *archive, const char *root, const char *relative)
                  fail_output("escribir indice en la microSD", child, errno);
             if (ok && !folder) {
                 archive->has_file = true;
-                ok = copy_file_into(archive, disk, child, size);
+                if (archive->counting) {
+                    archive->count_bytes += size;
+                    archive->count_files++;
+                } else {
+                    ok = copy_file_into(archive, disk, child, size);
+                }
             }
             if (!posix_unshorten(root))
                 ok = false;
@@ -469,6 +485,7 @@ static bool finish_output(Archive *archive, const char *partial, const char *des
         ok = fail_output("cerrar el archivo temporal", partial, errno);
     free(archive);
     if (ok) {
+        progress_title("Verificando el respaldo");
         backup_log_event("REABRIR TEMPORAL PARA VERIFICAR ruta=%s", partial);
         FILE *check = fopen(partial, "rb");
         if (!check) {
@@ -502,6 +519,19 @@ static bool finish_output(Archive *archive, const char *partial, const char *des
 static bool backup_tree(const char *root, const char *destination, SaveIdentity id, bool modified)
 {
     backup_log_event("LEER ORIGEN modificado=%d origen=%s destino=%s", modified, root, destination);
+    output_error = (ArchiveOutputError){0};
+    Archive *count = calloc(1, sizeof *count);
+    if (!count)
+        return fail_output("reservar memoria", root, ENOMEM);
+    count->counting = true;
+    bool counted = write_tree(count, root, "");
+    uint64_t total_bytes = count->count_bytes;
+    unsigned total_files = count->count_files;
+    free(count);
+    if (!counted)
+        return false;
+    backup_log_event("CONTEO archivos=%u bytes=%" PRIu64, total_files, total_bytes);
+    progress_start(total_bytes, total_files);
     char partial[PathCapacity];
     Archive *archive = open_output(destination, partial, id, modified);
     if (!archive)
@@ -510,6 +540,8 @@ static bool backup_tree(const char *root, const char *destination, SaveIdentity 
     bool ok = write_tree(archive, root, "") &&
               (!modified || archive->has_file || fail_output("la carpeta editada esta vacia", root, 0)) &&
               write_data(archive, &end, sizeof end);
+    if (ok)
+        progress_finish();
     return finish_output(archive, partial, destination, id, ok);
 }
 
@@ -826,6 +858,8 @@ static bool read_records(Archive *archive, const char *root, Archive *copy, bool
         if (copy && (!write_data(copy, fields, sizeof fields) || !write_data(copy, path, length)))
             return false;
         path[length] = '\0';
+        if (type == RegularFile)
+            progress_file(path, remaining);
         if (copy)
             backup_log_entry(type == Directory ? "COPIAR CARPETA NSV2" : "COPIAR ARCHIVO NSV2", path, remaining);
 #ifdef __SWITCH2__
@@ -944,8 +978,11 @@ bool archive_matches(FILE *file, SaveIdentity id, bool *modified)
 static bool read_archive(FILE *file, SaveIdentity id, const char *restore_root,
                          Archive *copy, bool expected_modified, bool compare, NativeRestore *native)
 {
+    struct stat file_info;
     if (fseek(file, 0, SEEK_SET) != 0)
         return false;
+    progress_start(fstat(fileno(file), &file_info) == 0 && file_info.st_size > 0 ?
+                   (uint64_t)file_info.st_size : 0, 0);
     Archive *archive = calloc(1, sizeof *archive);
     if (!archive)
         return false;
@@ -1033,15 +1070,18 @@ bool archive_restore_switch(FILE *file, SaveIdentity id, FILE *previous, SaveIde
         return native_error(&native, "abrir destino", device, 0);
     SaveManifest incoming = {0}, old = {0};
     native.manifest = &incoming;
+    progress_title("Analizando el respaldo");
     bool ok = read_archive(file, id, NULL, NULL, false, false, &native) && sort_manifest(&incoming);
     if (ok) {
         native.manifest = &old;
+        progress_title("Comparando con la partida actual");
         ok = read_archive(previous, previous_id, NULL, NULL, false, false, &native) &&
              sort_manifest(&old) && remove_obsolete(&native, &old, &incoming);
     }
     free_manifest(&old);
     free_manifest(&incoming);
     native.manifest = NULL;
+    progress_title("Restaurando la partida");
     return ok && read_archive(file, id, NULL, NULL, false, false, &native);
 }
 

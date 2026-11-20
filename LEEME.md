@@ -1,4 +1,4 @@
-# NovaSave2 0.4.14 para Nintendo Switch 2
+# NovaSave2 0.4.15 para Nintendo Switch 2
 
 Homebrew nativo para crear, verificar y restaurar copias locales de partidas de usuario. La app usa libounce y Ounce Devkit.
 
@@ -16,6 +16,12 @@ La lista muestra el nombre del archivo que está en la microSD. Al resaltarlo, a
 
 Si aparecen varios perfiles con el mismo nombre, el sufijo del ID permite distinguirlos. Si el menú muestra un código hexadecimal, anótalo junto con el mensaje.
 
+## Pantalla y progreso
+
+El menú principal muestra **A Respaldar**, **X Respaldos**, **Y Actualizar** y **+ Salir**. La fila elegida se resalta y los mensajes cambian de color: verde si todo salió bien, amarillo para avisos y rojo para errores.
+
+Durante cada operación aparece una barra con el porcentaje, el tiempo transcurrido y el restante, la velocidad, el nombre del archivo que se está copiando (con su número si se conoce el total) y los KB o MB copiados de ese archivo y del total. En HBmenu la app tiene su propia portada.
+
 ## Importar una carpeta ya extraída
 
 1. Copia la carpeta con los archivos de la partida a `switch/NovaSave2/importar/<ID del juego>/<nombre de la copia>/` en la microSD. El menú principal muestra el ID del juego.
@@ -31,7 +37,7 @@ Desde la lista de respaldos, selecciona el nombre del archivo y pulsa **X**, des
 ## Desempaquetar y preparar una copia para un perfil
 
 1. Selecciona un archivo `.nsv2` en la lista de respaldos y pulsa **Y Desempaquetar**. Los archivos sueltos se guardan en `switch/NovaSave2/editados/<ID del juego>/<nombre del respaldo>-001/`. La app muestra la ruta y agrega un número distinto para cada extracción.
-2. Edita los archivos desde la PC y deja los datos en esa misma carpeta. Conserva los nombres y la estructura que espera el juego. Al volver a la app, selecciona el juego y pulsa **ZR Abrir editados** para ir a la primera carpeta encontrada. **X** sigue mostrando todos los respaldos.
+2. Edita los archivos desde la PC y deja los datos en esa misma carpeta. Conserva los nombres y la estructura que espera el juego. Al volver a la app, selecciona el juego y pulsa **X Respaldos**: la carpeta aparece como **[EDITADOS]**.
 3. Selecciona la carpeta **[EDITADOS]** o un archivo `.nsv2` y pulsa **ZR** para guardar una copia NSV2 para un perfil. Elige el perfil, selecciona **Sí** y pulsa **A Confirmar**. La app crea un `*-perfil.nsv2` en la microSD, verifica su integridad y muestra la ruta.
 4. Pulsa **A Restaurar** sobre el respaldo, elige el perfil y confirma. NovaSave2 guarda una copia previa y solicita a la consola que confirme la escritura.
 
@@ -47,7 +53,7 @@ NovaSave2 lee títulos NACP comprimidos y sin comprimir. Cuando el sistema no de
 
 ## Si un respaldo no se crea
 
-En el menú de juegos, **A Respaldar** guarda una partida instalada en la consola. Desde **ZR Abrir editados**, elige una carpeta con archivos sueltos y usa **ZR Guardar copia NSV2**. Selecciona el perfil. Si falla la creación, la pantalla muestra el paso, la ruta y el código de la microSD o del archivo de origen. Si la creación termina, aparece **Respaldo creado y verificado** o **Copia NSV2 verificada** con la ruta.
+En el menú de juegos, **A Respaldar** guarda una partida instalada en la consola. Desde **X Respaldos**, elige una carpeta **[EDITADOS]** con archivos sueltos y usa **ZR Guardar copia NSV2**. Selecciona el perfil. Si falla la creación, la pantalla muestra el paso, la ruta y el código de la microSD o del archivo de origen. Si la creación termina, aparece **Respaldo creado y verificado** o **Copia NSV2 verificada** con la ruta.
 
 Cada intento genera un archivo `.log` con el mismo nombre base que el `.nsv2`, en la misma carpeta. También se guarda el registro de las copias previas a una restauración o a una ampliación. Si la app todavía no tenía ruta para el respaldo, se interrumpió o no pudo mover el registro, búscalo como `diagnostico-*.log` directamente en `switch/NovaSave2/`. La pantalla muestra **Log:** con la ruta al terminar. Si la microSD no admite escritura, la app avisa.
 

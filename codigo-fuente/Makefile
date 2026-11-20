@@ -6,7 +6,7 @@ endif
 
 APP_TITLE := NovaSave2
 APP_AUTHOR := Nova
-APP_VERSION := 0.4.14
+APP_VERSION := 0.4.15
 
 include $(DEVKITPRO)/libounce/switch2_rules
 
@@ -22,10 +22,10 @@ export OUTPUT := $(CURDIR)/$(TARGET)
 export VPATH := $(CURDIR)/source
 export DEPSDIR := $(CURDIR)/$(BUILD)
 export LD := $(CC)
-export OFILES := main.o backup_log.o archive.o catalog.o titledata.o
+export OFILES := main.o backup_log.o archive.o catalog.o titledata.o progress.o
 export INCLUDE := -I$(LIBNX)/include -I$(PORTLIBS)/include
 export LIBPATHS := -L$(LIBNX)/lib -L$(PORTLIBS)/lib
-export NROFLAGS := --icon=$(LIBNX)/default_icon.jpg --nacp=$(OUTPUT).nacp
+export NROFLAGS := --icon=$(CURDIR)/icon.jpg --nacp=$(OUTPUT).nacp
 
 .PHONY: all clean
 all:
