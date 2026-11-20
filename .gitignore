@@ -1,0 +1,4 @@
+codigo-fuente/build/
+*.elf
+*.nro
+*.nacp
