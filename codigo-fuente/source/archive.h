@@ -19,6 +19,11 @@ typedef struct {
 } ArchiveOutputError;
 
 const ArchiveOutputError *archive_output_error(void);
+/* Metodo por tramos para rutas mas largas que el limite de la consola.
+ * Requiere la partida montada con escritura; nunca confirma por si mismo. */
+void archive_set_relocation(bool allowed);
+bool archive_needs_relocation(void);
+unsigned archive_relocations(void);
 bool archive_backup(const char *root, const char *destination, SaveIdentity id);
 bool archive_backup_modified(const char *root, const char *destination, SaveIdentity id);
 bool archive_identity(FILE *file, SaveIdentity *id, bool *modified);

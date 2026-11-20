@@ -40,15 +40,17 @@ static bool hash_final(Hash *hash, unsigned char out[32])
 }
 #endif
 
-/* PathCapacity holds a mount prefix plus the longest relative path. The
- * console's own limit is FS_MAX_PATH (0x301): "/" + relative + NUL. A path
- * longer than that exists only if the game renamed a folder into a deep spot,
- * and the file service cannot open it by name. */
-enum { PathCapacity = 1024, MaxDepth = 384, BufferSize = 65536 };
+/* Rutas: la consola abre como maximo "/" + 767 caracteres (FS_MAX_PATH 0x301
+ * con el NUL). Una partida puede tener entradas mas profundas si el juego movio
+ * una carpeta a un lugar hondo. Esas entradas no se pueden abrir por nombre,
+ * pero si se puede mover una carpeta intermedia a la raiz. El metodo por tramos
+ * mueve la carpeta, trabaja con la ruta corta y la devuelve a su lugar. El NSV2
+ * guarda siempre la ruta logica completa (hasta PathCapacity - 1). */
+enum { PathCapacity = 4096, MaxDepth = 1024, BufferSize = 65536, MaxHops = 32 };
 #ifdef __SWITCH2__
-enum { RelativeLimit = FS_MAX_PATH - 2 };
+enum { RelativeLimit = FS_MAX_PATH - 2, HopPathSize = FS_MAX_PATH };
 #else
-enum { RelativeLimit = 0x301 - 2 }; /* same limit, so a PC copy restores on the console */
+enum { RelativeLimit = 0x301 - 2, HopPathSize = 0x301 }; /* mismo limite que la consola */
 #endif
 enum { End = 0, Directory = 1, RegularFile = 2 };
 
@@ -152,110 +154,259 @@ static bool directory_end(void)
 #endif
 }
 
-static bool too_long(const char *path, size_t length)
+
+/* Metodo por tramos: Route guarda las carpetas movidas a la raiz, en orden. */
+typedef struct {
+    char home[HopPathSize];
+    char temp[HopPathSize];
+} Hop;
+typedef struct {
+    Hop hop[MaxHops];
+    unsigned count;
+} Route;
+
+static bool relocation_allowed, relocation_needed;
+static unsigned relocations_done;
+
+void archive_set_relocation(bool allowed)
 {
-    backup_log_event("RUTA DEMASIADO LARGA caracteres=%zu limite=%d ruta=%s",
-                     length + 1, RelativeLimit + 1, path);
-    return fail_output("leer ruta mas larga que el limite de la consola (768)", path, ENAMETOOLONG);
+    relocation_allowed = allowed;
+    relocation_needed = false;
+    relocations_done = 0;
 }
 
-static bool write_tree(Archive *archive, const char *root, const char *relative)
+bool archive_needs_relocation(void)
 {
-    char *disk = malloc(2 * PathCapacity);
-    if (!disk)
-        return fail_output("reservar memoria", relative, ENOMEM);
-    char *child = disk + PathCapacity;
+    return relocation_needed;
+}
+
+unsigned archive_relocations(void)
+{
+    return relocations_done;
+}
+
+/* Ultima barra en work[1..RelativeLimit]: la carpeta que se mueve. */
+static size_t hop_cut(const char *work)
+{
+    size_t cut = 0;
+    for (size_t i = 1; i <= RelativeLimit && work[i]; i++)
+        if (work[i] == '/')
+            cut = i;
+    return cut;
+}
+
+static Route posix_route;
+
+static bool posix_unshorten(const char *root)
+{
     bool ok = true;
-    if (!make_path(disk, root, relative)) {
-        free(disk);
-        return fail_output("validar ruta de carpeta de origen", relative, ENAMETOOLONG);
+    char from[PathCapacity], to[PathCapacity];
+    while (posix_route.count) {
+        Hop *hop = &posix_route.hop[--posix_route.count];
+        if (!make_path(from, root, hop->temp) || !make_path(to, root, hop->home) ||
+            rename(from, to) != 0) {
+            ok = fail_output("devolver carpeta movida por tramos", hop->home, errno);
+            continue;
+        }
+        backup_log_event("TRAMO DEVOLVER desde=%s a=%s", hop->temp, hop->home);
     }
-    DIR *dir = opendir(disk);
-    if (dir == NULL) {
-        ok = fail_output("abrir carpeta de origen", disk, errno);
-        free(disk);
-        return ok;
+    return ok;
+}
+
+/* Deja en phys una ruta relativa de RelativeLimit caracteres o menos. */
+static bool posix_shorten(const char *root, const char *logical, char *phys)
+{
+    posix_route.count = 0;
+    char disk[PathCapacity], target[PathCapacity];
+    int length = snprintf(phys, PathCapacity, "%s", logical);
+    if (length < 0 || length >= PathCapacity)
+        return fail_output("validar ruta logica", logical, ENAMETOOLONG);
+    while (strlen(phys) > RelativeLimit) {
+        if (!relocation_allowed) {
+            relocation_needed = true;
+            backup_log_event("RUTA LARGA caracteres=%zu limite=%d: se necesita el metodo por tramos ruta=%s",
+                             strlen(phys) + 1, RelativeLimit + 1, logical);
+            return fail_output("leer ruta larga (requiere tramos)", logical, ENAMETOOLONG);
+        }
+        size_t cut = hop_cut(phys);
+        if (cut == 0 || posix_route.count == MaxHops) {
+            posix_unshorten(root);
+            return fail_output("dividir ruta larga en tramos", logical, ENAMETOOLONG);
+        }
+        Hop *hop = &posix_route.hop[posix_route.count];
+        memcpy(hop->home, phys, cut);
+        hop->home[cut] = '\0';
+        bool found = false;
+        for (unsigned n = 0; n < 1000 && !found; n++) {
+            struct stat info;
+            snprintf(hop->temp, sizeof hop->temp, ".nsv2-tramo-%u", n);
+            if (!make_path(target, root, hop->temp))
+                break;
+            if (lstat(target, &info) == 0)
+                continue;
+            if (!storage_path_missing(errno)) {
+                posix_unshorten(root);
+                return fail_output("buscar nombre temporal para tramos", hop->temp, errno);
+            }
+            found = true;
+        }
+        if (!found || !make_path(disk, root, hop->home)) {
+            posix_unshorten(root);
+            return fail_output("buscar nombre temporal para tramos", logical, EEXIST);
+        }
+        if (rename(disk, target) != 0) {
+            int error = errno;
+            posix_unshorten(root);
+            return fail_output("mover carpeta para leer por tramos", hop->home, error);
+        }
+        backup_log_event("TRAMO MOVER desde=%s a=%s", hop->home, hop->temp);
+        posix_route.count++;
+        relocations_done++;
+        size_t rest = strlen(phys + cut);
+        size_t temp = strlen(hop->temp);
+        memmove(phys + temp, phys + cut, rest + 1);
+        memcpy(phys, hop->temp, temp);
     }
+    return true;
+}
+
+typedef struct {
+    char **items;
+    size_t count, capacity;
+} NameList;
+
+static void free_names(NameList *names)
+{
+    for (size_t i = 0; i < names->count; i++)
+        free(names->items[i]);
+    free(names->items);
+}
+
+static bool add_name(NameList *names, const char *name)
+{
+    if (names->count == names->capacity) {
+        size_t capacity = names->capacity ? names->capacity * 2 : 16;
+        char **items = realloc(names->items, capacity * sizeof *items);
+        if (!items)
+            return false;
+        names->items = items;
+        names->capacity = capacity;
+    }
+    char *copy = strdup(name);
+    if (!copy)
+        return false;
+    names->items[names->count++] = copy;
+    return true;
+}
+
+/* Lee los nombres de una carpeta y la cierra antes de mover nada. */
+static bool list_folder(const char *root, const char *relative, NameList *names, char *phys, char *disk)
+{
+    if (!posix_shorten(root, relative, phys))
+        return false;
+    bool ok = make_path(disk, root, phys) ||
+              fail_output("validar ruta de carpeta de origen", relative, ENAMETOOLONG);
+    DIR *dir = ok ? opendir(disk) : NULL;
+    if (ok && !dir)
+        ok = fail_output("abrir carpeta de origen", relative, errno);
     while (ok) {
         errno = 0;
         struct dirent *entry = readdir(dir);
         if (entry == NULL) {
-            ok = directory_end() || fail_output("listar archivos de origen", disk, errno);
+            ok = directory_end() || fail_output("listar archivos de origen", relative, errno);
             break;
         }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        int length = snprintf(child, PathCapacity, "%s%s%s", relative,
-                              relative[0] ? "/" : "", entry->d_name);
-        struct stat info;
-        if (length <= 0 || length >= PathCapacity) {
-            ok = too_long(relative, strlen(relative) + 1 + strlen(entry->d_name));
-            break;
+        if (!add_name(names, entry->d_name))
+            ok = fail_output("reservar memoria", relative, ENOMEM);
+    }
+    if (dir && closedir(dir) != 0)
+        ok = fail_output("cerrar carpeta de origen", relative, errno);
+    return posix_unshorten(root) && ok;
+}
+
+static bool copy_file_into(Archive *archive, const char *disk, const char *child, uint64_t remaining)
+{
+    FILE *input = fopen(disk, "rb");
+    if (input == NULL)
+        return fail_output("abrir archivo de origen", child, errno);
+    bool ok = true;
+    uint64_t offset = 0;
+    while (ok && remaining > 0) {
+        size_t chunk = remaining < BufferSize ? (size_t)remaining : BufferSize;
+        ok = (fread(archive->buffer, 1, chunk, input) == chunk ||
+              fail_output("leer archivo de origen", child, ferror(input) ? errno : 0)) &&
+             (write_data(archive, archive->buffer, chunk) ||
+              fail_output("escribir respaldo en la microSD", child, errno));
+        if (ok) {
+            remaining -= chunk;
+            offset += chunk;
         }
-        if (length > RelativeLimit) {
-            ok = too_long(child, (size_t)length);
+    }
+    if (ok && (fgetc(input) != EOF || ferror(input)))
+        ok = fail_output("confirmar fin del archivo de origen", child, ferror(input) ? errno : 0);
+    if (fclose(input) != 0)
+        ok = fail_output("cerrar archivo de origen", child, errno);
+    if (!ok)
+        backup_log_event("AVANCE ARCHIVO bytes_completados=%" PRIu64 " ruta=%s", offset, child);
+    return ok;
+}
+
+static bool write_tree(Archive *archive, const char *root, const char *relative)
+{
+    char *buffers = malloc(3 * PathCapacity);
+    if (!buffers)
+        return fail_output("reservar memoria", relative, ENOMEM);
+    char *child = buffers, *phys = buffers + PathCapacity, *disk = buffers + 2 * PathCapacity;
+    NameList names = {0};
+    bool ok = list_folder(root, relative, &names, phys, disk);
+    for (size_t i = 0; ok && i < names.count; i++) {
+        const char *name = names.items[i];
+        int length = snprintf(child, PathCapacity, "%s%s%s", relative, relative[0] ? "/" : "", name);
+        if (length <= 0 || length >= PathCapacity) {
+            ok = fail_output("ruta mas larga que el maximo de NSV2 (4095)", relative, ENAMETOOLONG);
             break;
         }
         if (!safe_path(child, (size_t)length)) {
             ok = fail_output("validar nombre de entrada de origen", child, EINVAL);
             break;
         }
-        if (!make_path(disk, root, child)) {
-            ok = too_long(child, (size_t)length);
+        if (!posix_shorten(root, child, phys)) {
+            ok = false;
             break;
         }
-        if (lstat(disk, &info) != 0) {
+        struct stat info;
+        if (!make_path(disk, root, phys)) {
+            ok = fail_output("validar ruta de entrada de origen", child, ENAMETOOLONG);
+        } else if (lstat(disk, &info) != 0) {
             ok = fail_output("examinar entrada de origen", child, errno);
-            break;
-        }
-        if (info.st_size < 0 || (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode))) {
+        } else if (info.st_size < 0 || (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode))) {
             ok = fail_output("examinar tipo de entrada de origen", child, EINVAL);
-            break;
-        }
-        bool folder = S_ISDIR(info.st_mode);
-        uint64_t remaining = folder ? 0 : (uint64_t)info.st_size;
-        backup_log_entry(folder ? "CARPETA" : "COPIAR ARCHIVO", disk, remaining);
-        unsigned char record[11] = {folder ? Directory : RegularFile};
-        encode(record + 1, (unsigned)length, 2);
-        encode(record + 3, remaining, 8);
-        ok = write_data(archive, record, sizeof record) &&
-             write_data(archive, child, (size_t)length);
-        if (!ok) {
-            fail_output("escribir indice en la microSD", child, errno);
-            break;
-        }
-        if (folder) {
-            ok = write_tree(archive, root, child);
+        } else {
+            bool folder = S_ISDIR(info.st_mode);
+            uint64_t size = folder ? 0 : (uint64_t)info.st_size;
+            backup_log_entry(folder ? "CARPETA" : "COPIAR ARCHIVO", child, size);
+            unsigned char record[11] = {folder ? Directory : RegularFile};
+            encode(record + 1, (unsigned)length, 2);
+            encode(record + 3, size, 8);
+            ok = (write_data(archive, record, sizeof record) &&
+                  write_data(archive, child, (size_t)length)) ||
+                 fail_output("escribir indice en la microSD", child, errno);
+            if (ok && !folder) {
+                archive->has_file = true;
+                ok = copy_file_into(archive, disk, child, size);
+            }
+            if (!posix_unshorten(root))
+                ok = false;
+            if (ok && folder)
+                ok = write_tree(archive, root, child);
             continue;
         }
-        archive->has_file = true;
-        FILE *input = fopen(disk, "rb");
-        if (input == NULL) {
-            ok = fail_output("abrir archivo de origen", disk, errno);
-            break;
-        }
-        uint64_t offset = 0;
-        while (ok && remaining > 0) {
-            size_t chunk = remaining < BufferSize ? (size_t)remaining : BufferSize;
-            ok = (fread(archive->buffer, 1, chunk, input) == chunk ||
-                  fail_output("leer archivo de origen", disk, ferror(input) ? errno : 0)) &&
-                 (write_data(archive, archive->buffer, chunk) ||
-                  fail_output("escribir respaldo en la microSD", child, errno));
-            if (ok) {
-                remaining -= chunk;
-                offset += chunk;
-            }
-        }
-        if (ok && (fgetc(input) != EOF || ferror(input)))
-            ok = fail_output("confirmar fin del archivo de origen", disk, ferror(input) ? errno : 0);
-        if (fclose(input) != 0)
-            ok = fail_output("cerrar archivo de origen", disk, errno);
-        if (!ok)
-            backup_log_event("AVANCE ARCHIVO bytes_completados=%" PRIu64 " ruta=%s", offset, disk);
+        posix_unshorten(root);
     }
-    if (closedir(dir) != 0)
-        ok = fail_output("cerrar carpeta de origen", relative, errno);
-    free(disk);
+    free_names(&names);
+    free(buffers);
     return ok;
 }
 
@@ -398,6 +549,7 @@ typedef struct {
     FsFileSystem *fs;
     SaveManifest *manifest;
     bool staged;
+    bool pending_commit;
     ArchiveRestoreError *error;
 #else
     int unused;
@@ -405,8 +557,13 @@ typedef struct {
 } NativeRestore;
 
 #ifdef __SWITCH2__
+static Route native_route;
+
 static bool native_error(NativeRestore *restore, const char *operation, const char *path, Result result)
 {
+    backup_log_event("ERROR RESTAURAR paso=%s fs=0x%08" PRIX32 " ruta=%s", operation, (uint32_t)result, path);
+    if (restore->error->operation)
+        return false;
     restore->error->operation = operation;
     restore->error->result = result;
     snprintf(restore->error->path, sizeof restore->error->path, "%s", path);
@@ -417,6 +574,12 @@ static bool confirm_stage(NativeRestore *restore, const char *path)
 {
     if (!restore->staged)
         return true;
+    if (native_route.count) {
+        /* Nunca confirmar con una carpeta fuera de su lugar. */
+        restore->pending_commit = true;
+        return true;
+    }
+    restore->pending_commit = false;
     Result rc = fsFsCommit(restore->fs);
     if (R_FAILED(rc))
         return native_error(restore, "confirmar etapa", path, rc);
@@ -441,13 +604,94 @@ static bool record_path(SaveManifest *manifest, const char *path, unsigned char 
     return true;
 }
 
+static bool native_unshorten(NativeRestore *restore)
+{
+    bool ok = true;
+    while (native_route.count) {
+        Hop *hop = &native_route.hop[--native_route.count];
+        Result rc = fsFsRenameDirectory(restore->fs, hop->temp, hop->home);
+        if (R_FAILED(rc)) {
+            ok = native_error(restore, "devolver carpeta movida por tramos", hop->home, rc);
+            continue;
+        }
+        backup_log_event("TRAMO DEVOLVER desde=%s a=%s", hop->temp, hop->home);
+    }
+    if (ok && restore->pending_commit)
+        ok = confirm_stage(restore, "tramo");
+    return ok;
+}
+
+/* Deja en path ("/" + ruta) una ruta que la consola puede abrir. */
+static bool native_shorten(NativeRestore *restore, const char *logical, char path[FS_MAX_PATH])
+{
+    native_route.count = 0;
+    char work[PathCapacity];
+    int length = snprintf(work, sizeof work, "%s", logical);
+    if (length < 0 || length >= PathCapacity)
+        return native_error(restore, "validar ruta logica", logical, 0);
+    while (strlen(work) > RelativeLimit) {
+        size_t cut = hop_cut(work);
+        if (cut == 0 || native_route.count == MaxHops) {
+            native_unshorten(restore);
+            return native_error(restore, "dividir ruta larga en tramos", logical, 0);
+        }
+        Hop *hop = &native_route.hop[native_route.count];
+        memset(hop, 0, sizeof *hop);
+        hop->home[0] = '/';
+        memcpy(hop->home + 1, work, cut);
+        bool found = false;
+        Result rc = 0;
+        for (unsigned n = 0; n < 1000 && !found; n++) {
+            FsDirEntryType kind;
+            snprintf(hop->temp, sizeof hop->temp, "/.nsv2-tramo-%u", n);
+            rc = fsFsGetEntryType(restore->fs, hop->temp, &kind);
+            if (R_SUCCEEDED(rc))
+                continue;
+            if (R_VALUE(rc) != MAKERESULT(2, 1))
+                break;
+            found = true;
+        }
+        if (!found) {
+            native_unshorten(restore);
+            return native_error(restore, "buscar nombre temporal para tramos", logical, rc);
+        }
+        rc = fsFsRenameDirectory(restore->fs, hop->home, hop->temp);
+        if (R_FAILED(rc)) {
+            native_unshorten(restore);
+            return native_error(restore, "mover carpeta para escribir por tramos", hop->home, rc);
+        }
+        backup_log_event("TRAMO MOVER desde=%s a=%s", hop->home, hop->temp);
+        native_route.count++;
+        size_t rest = strlen(work + cut);
+        size_t temp = strlen(hop->temp + 1);
+        memmove(work + temp, work + cut, rest + 1);
+        memcpy(work, hop->temp + 1, temp);
+    }
+    /* El bucle deja work con RelativeLimit caracteres o menos. */
+    memset(path, 0, FS_MAX_PATH);
+    path[0] = '/';
+    memcpy(path + 1, work, strlen(work));
+    return true;
+}
+
+static bool restore_native_at(Archive *archive, NativeRestore *restore, unsigned char type,
+                              const char *path, uint64_t size);
+
 static bool restore_native_record(Archive *archive, NativeRestore *restore, unsigned char type,
                                   const char *relative, uint64_t size)
 {
-    char path[FS_MAX_PATH] = {0};
-    int length = snprintf(path, sizeof path, "/%s", relative);
-    if (length < 0 || (size_t)length >= sizeof path || size > INT64_MAX)
+    char path[FS_MAX_PATH];
+    if (size > INT64_MAX)
         return native_error(restore, "ruta o tamano invalido", relative, 0);
+    if (!native_shorten(restore, relative, path))
+        return false;
+    bool ok = restore_native_at(archive, restore, type, path, size);
+    return native_unshorten(restore) && ok;
+}
+
+static bool restore_native_at(Archive *archive, NativeRestore *restore, unsigned char type,
+                              const char *path, uint64_t size)
+{
 
     FsDirEntryType existing;
     Result rc = fsFsGetEntryType(restore->fs, path, &existing);
@@ -570,7 +814,7 @@ static bool read_records(Archive *archive, const char *root, Archive *copy, bool
         if (type == End)
             return true;
         unsigned char fields[10];
-        char path[PathCapacity], disk[PathCapacity];
+        char path[PathCapacity], disk[PathCapacity], phys[PathCapacity];
         if ((type != Directory && type != RegularFile) ||
             !read_data(archive, fields, sizeof fields))
             return false;
@@ -587,8 +831,6 @@ static bool read_records(Archive *archive, const char *root, Archive *copy, bool
 #ifdef __SWITCH2__
         if (native) {
             if (native->manifest) {
-                if (length > RelativeLimit)
-                    return native_error(native, "ruta mas larga que el limite de la consola (768)", path, 0);
                 if (!record_path(native->manifest, path, type))
                     return native_error(native, "indexar el respaldo", path, 0);
             } else {
@@ -599,23 +841,30 @@ static bool read_records(Archive *archive, const char *root, Archive *copy, bool
         }
 #endif
         FILE *output = NULL;
+        bool shortened = false;
         if (root) {
-            if (!make_path(disk, root, path))
-                return false;
             if (compare) {
-                struct stat info;
-                if (lstat(disk, &info) != 0)
+                /* Releer la partida: las rutas largas se comparan por tramos. */
+                if (!posix_shorten(root, path, phys))
                     return false;
-                if (type == Directory) {
-                    if (!S_ISDIR(info.st_mode))
+                shortened = true;
+                struct stat info;
+                bool found = make_path(disk, root, phys) && lstat(disk, &info) == 0;
+                bool fits = found && (type == Directory ? S_ISDIR(info.st_mode) :
+                                      S_ISREG(info.st_mode) && info.st_size >= 0 &&
+                                      (uint64_t)info.st_size == remaining);
+                if (fits && type == Directory) {
+                    if (!posix_unshorten(root))
                         return false;
                     continue;
                 }
-                if (!S_ISREG(info.st_mode) || info.st_size < 0 || (uint64_t)info.st_size != remaining)
+                output = fits ? fopen(disk, "rb") : NULL;
+                if (!output) {
+                    posix_unshorten(root);
                     return false;
-                output = fopen(disk, "rb");
-                if (!output)
-                    return false;
+                }
+            } else if (!make_path(disk, root, path)) {
+                return false;
             } else {
                 if (type == Directory) {
                     if (mkdir(disk, 0700) != 0)
@@ -647,6 +896,8 @@ static bool read_records(Archive *archive, const char *root, Archive *copy, bool
             if (fclose(output) != 0)
                 ok = false;
         }
+        if (shortened && !posix_unshorten(root))
+            ok = false;
         if (!ok) {
             if (copy)
                 fail_output("copiar datos del NSV2 de origen", path,
@@ -757,15 +1008,17 @@ static bool remove_obsolete(NativeRestore *native, const SaveManifest *old, cons
             bsearch(before, incoming->items, incoming->count, sizeof *incoming->items, compare_path) : NULL;
         if (after && before->type == after->type)
             continue;
-        char path[FS_MAX_PATH] = {0};
-        int length = snprintf(path, sizeof path, "/%s", before->path);
-        if (length < 0 || (size_t)length >= sizeof path)
-            return native_error(native, "validar ruta anterior", before->path, 0);
+        char path[FS_MAX_PATH];
+        if (!native_shorten(native, before->path, path))
+            return false;
         Result rc = before->type == Directory ? fsFsDeleteDirectory(native->fs, path)
                                               : fsFsDeleteFile(native->fs, path);
-        if (R_FAILED(rc))
-            return native_error(native, "retirar archivo o carpeta anterior", path, rc);
-        if (!confirm_stage(native, path))
+        if (R_FAILED(rc)) {
+            native_error(native, "retirar archivo o carpeta anterior", before->path, rc);
+            native_unshorten(native);
+            return false;
+        }
+        if (!native_unshorten(native) || !confirm_stage(native, before->path))
             return false;
     }
     return true;

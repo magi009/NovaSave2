@@ -75,7 +75,7 @@ void backup_log_start(const char *directory, const char *action, uint64_t title)
         break;
     }
     if (log_file)
-        backup_log_event("INICIO NovaSave2 0.4.13 operacion=%s juego=%016" PRIX64, action, title);
+        backup_log_event("INICIO NovaSave2 0.4.14 operacion=%s juego=%016" PRIX64, action, title);
     else
         log_path[0] = '\0';
     errno = saved_errno;

@@ -291,7 +291,11 @@ static void report_storage(const char *operation, const char *path, int system_e
     backup_log_event("ALMACENAMIENTO paso=%s errno=%d fs=0x%08" PRIX32 " ruta=%s",
                      operation, system_error, native, path);
     report("Fallo al %s. FS 0x%08" PRIX32 ", errno %d.", operation, native, system_error);
-    snprintf(detail, sizeof detail, "%.250s", path);
+    size_t length = strlen(path);
+    if (length > 250)
+        snprintf(detail, sizeof detail, "...%s", path + length - 247);
+    else
+        snprintf(detail, sizeof detail, "%s", path);
 }
 
 static void report_archive_failure(void)
@@ -516,24 +520,60 @@ static void select_created(const char *path)
     }
 }
 
+/* Respalda la partida. Si tiene rutas mas largas que el limite de la consola,
+ * la monta con escritura y usa el metodo por tramos: mueve carpetas, lee y las
+ * devuelve. Nunca confirma: al desmontar, la consola descarta cualquier cambio. */
+static unsigned last_backup_tramos;
+
+static bool backup_save(const SaveEntry *save, const char *path, Result *mount_result)
+{
+    last_backup_tramos = 0;
+    archive_set_relocation(false);
+    backup_log_event("MONTAR PARTIDA EN SOLO LECTURA ruta=%s", SAVE_ROOT);
+    Result result = fsdevMountSaveDataReadOnly("novasave", save->id.title, save->uid);
+    backup_log_event("RESULTADO DE MONTAJE fs=0x%08" PRIX32, (uint32_t)result);
+    *mount_result = result;
+    if (R_FAILED(result))
+        return false;
+    bool ok = archive_backup(SAVE_ROOT, path, save->id);
+    int unmount = fsdevUnmountDevice("novasave");
+    backup_log_event("DESMONTAR PARTIDA rc=%d", unmount);
+    if (ok || !archive_needs_relocation())
+        return ok;
+
+    backup_log_event("RUTAS LARGAS: REINTENTAR POR TRAMOS (escritura sin confirmar)");
+    result = fsdevMountSaveData("novasave", save->id.title, save->uid);
+    backup_log_event("RESULTADO DE MONTAJE PARA TRAMOS fs=0x%08" PRIX32, (uint32_t)result);
+    *mount_result = result;
+    if (R_FAILED(result))
+        return false;
+    archive_set_relocation(true);
+    ok = archive_backup(SAVE_ROOT, path, save->id);
+    unsigned moved = archive_relocations();
+    last_backup_tramos = moved;
+    archive_set_relocation(false);
+    unmount = fsdevUnmountDevice("novasave");
+    backup_log_event("DESMONTAR SIN CONFIRMAR rc=%d tramos=%u", unmount, moved);
+    return ok;
+}
+
 static void make_backup(const SaveEntry *save)
 {
     char path[BackupPathSize];
     if (!ensure_backup_folder(save) || !new_backup_path(path, sizeof path, save, ""))
         return;
 
-    backup_log_event("MONTAR PARTIDA EN SOLO LECTURA ruta=%s", SAVE_ROOT);
-    Result result = fsdevMountSaveDataReadOnly("novasave", save->id.title, save->uid);
-    backup_log_event("RESULTADO DE MONTAJE fs=0x%08" PRIX32, (uint32_t)result);
+    Result result = 0;
+    bool ok = backup_save(save, path, &result);
     if (R_FAILED(result)) {
-        report("No se pudo abrir la partida en lectura (0x%08" PRIX32 ").", (uint32_t)result);
+        report("No se pudo abrir la partida (0x%08" PRIX32 ").", (uint32_t)result);
         return;
     }
-    bool ok = archive_backup(SAVE_ROOT, path, save->id);
-    int unmount = fsdevUnmountDevice("novasave");
-    backup_log_event("DESMONTAR PARTIDA rc=%d", unmount);
     if (ok) {
-        report("Respaldo creado y verificado.");
+        if (last_backup_tramos)
+            report("Respaldo creado y verificado por tramos (rutas largas).");
+        else
+            report("Respaldo creado y verificado.");
         snprintf(detail, sizeof detail, "Archivo guardado: %.230s", path + strlen("sdmc:/"));
     } else {
         report_archive_failure();
@@ -544,8 +584,15 @@ static bool restore_mounted(const SaveEntry *save, FILE *input, SaveIdentity sou
 {
     char recovery[BackupPathSize];
     backup_log_event("RESPALDAR PARTIDA ACTUAL DEL PERFIL DE DESTINO");
-    if (!ensure_backup_folder(save) || !new_backup_path(recovery, sizeof recovery, save, "-previo") ||
-        !archive_backup(SAVE_ROOT, recovery, save->id)) {
+    if (!ensure_backup_folder(save) || !new_backup_path(recovery, sizeof recovery, save, "-previo")) {
+        report("Cancelado. No se pudo verificar la copia previa del perfil de destino.");
+        return false;
+    }
+    archive_set_relocation(true);
+    bool previous_ok = archive_backup(SAVE_ROOT, recovery, save->id);
+    backup_log_event("COPIA PREVIA tramos=%u", archive_relocations());
+    archive_set_relocation(false);
+    if (!previous_ok) {
         report("Cancelado. No se pudo verificar la copia previa del perfil de destino.");
         return false;
     }
@@ -873,14 +920,13 @@ static void extend_journal(const SaveEntry *save, const JournalPlan *expected)
         report("No se pudo preparar la copia previa en la microSD.");
         return;
     }
-    Result rc = fsdevMountSaveDataReadOnly("novasave", save->id.title, save->uid);
+    Result rc = 0;
+    bool saved = backup_save(save, recovery, &rc);
     if (R_FAILED(rc)) {
         report("No se pudo abrir el destino para respaldarlo (0x%08" PRIX32 ").", (uint32_t)rc);
         return;
     }
-    bool saved = archive_backup(SAVE_ROOT, recovery, save->id);
-    int unmount = fsdevUnmountDevice("novasave");
-    if (!saved || unmount != 0) {
+    if (!saved) {
         report("Cancelado. No se pudo respaldar o desmontar la partida.");
         return;
     }
@@ -904,13 +950,27 @@ static void verify_committed(const SaveEntry *save, FILE *input, SaveIdentity so
 {
     char recovery[sizeof detail];
     snprintf(recovery, sizeof recovery, "%s", detail);
+    archive_set_relocation(false);
     Result result = fsdevMountSaveDataReadOnly("novasave", save->id.title, save->uid);
+    bool matches = false;
+    if (R_SUCCEEDED(result)) {
+        matches = archive_verify_restored(input, source, SAVE_ROOT);
+        fsdevUnmountDevice("novasave");
+        if (!matches && archive_needs_relocation()) {
+            backup_log_event("RELEER POR TRAMOS (escritura sin confirmar)");
+            result = fsdevMountSaveData("novasave", save->id.title, save->uid);
+            if (R_SUCCEEDED(result)) {
+                archive_set_relocation(true);
+                matches = archive_verify_restored(input, source, SAVE_ROOT);
+                archive_set_relocation(false);
+                fsdevUnmountDevice("novasave");
+            }
+        }
+    }
     if (R_FAILED(result)) {
         report("Escritura confirmada. Fallo al releer el destino (0x%08" PRIX32 ").",
                (uint32_t)result);
     } else {
-        bool matches = archive_verify_restored(input, source, SAVE_ROOT);
-        fsdevUnmountDevice("novasave");
         if (matches)
             report("Guardado y verificado en %.36s.", save->profile);
         else

@@ -1,4 +1,4 @@
-# NovaSave2 0.4.13 para Nintendo Switch 2
+# NovaSave2 0.4.14 para Nintendo Switch 2
 
 Homebrew nativo para crear, verificar y restaurar copias locales de partidas de usuario. La app usa libounce y Ounce Devkit.
 
@@ -53,6 +53,16 @@ Cada intento genera un archivo `.log` con el mismo nombre base que el `.nsv2`, e
 
 El registro incluye la operación, el ID del juego, pasos con tiempo transcurrido, rutas y tamaños de archivos, comprobación SHA-256, publicación del respaldo y los códigos disponibles en caso de error. Registra hasta 5000 entradas individuales por intento y sigue anotando los errores y el total. El registro puede mostrar nombres de archivos e identificadores de perfil presentes en las rutas. Puedes adjuntar el `.log` para diagnóstico sin compartir la partida.
 
+## Partidas con rutas muy largas (método por tramos)
+
+La consola no abre rutas de más de 768 caracteres, pero algunas partidas tienen carpetas más profundas. NovaSave2 lo detecta y cambia de método por su cuenta:
+
+- **Respaldo:** primero intenta en solo lectura. Si encuentra una ruta demasiado larga, monta la partida con escritura, mueve temporalmente una carpeta intermedia a la raíz (`.nsv2-tramo-N`), lee ese tramo con una ruta corta y la devuelve a su lugar. Nunca confirma la escritura: al desmontar, la consola descarta cualquier cambio. El `.nsv2` guarda las rutas completas y se crea en la misma carpeta del juego. La pantalla muestra **Respaldo creado y verificado por tramos**.
+- **Restauración:** escribe cada tramo en una ruta corta y lo mueve a su posición exacta. En el modo por etapas, ninguna etapa se confirma mientras una carpeta está fuera de su lugar.
+- **Verificación:** la relectura posterior compara las rutas largas con el mismo método.
+
+El registro anota cada movimiento como `TRAMO MOVER` y `TRAMO DEVOLVER`. Las partidas normales no usan este método.
+
 ## Si falla al copiar en la consola
 
 La restauración normal conserva los archivos idénticos, escribe los bloques que cambiaron y confirma todos los cambios de una vez. Si aparece **2002-6706**, vuelve a seleccionar el mismo respaldo y el perfil correcto. En la pantalla de confirmación, pulsa **X Restaurar por etapas** y después elige **Sí** y pulsa **A Confirmar**. El modo por etapas confirma grupos pequeños de cambios y relee la partida al finalizar. Cada etapa confirmada persiste. Si la operación se interrumpe o la consola rechaza otra etapa, puede quedar una partida parcial. Conserva el respaldo `-previo.nsv2` y mantén cerrado el juego hasta que la app indique **Guardado y verificado**. Si el servicio de archivos devuelve un error, la pantalla muestra el código hexadecimal, la operación y el archivo que falló. La app confirma la escritura únicamente después de completar la copia y conserva el respaldo `-previo.nsv2` en la microSD.
@@ -71,6 +81,6 @@ La app monta la partida existente a través del servicio de archivos. Al restaur
 
 Con devkitPro y Ounce Devkit instalados, instala también `switch-zlib` y habilita `DEVKITPRO`, `DEVKITA64` y las herramientas de devkitPro en `PATH`. Abre la carpeta `codigo-fuente` y ejecuta `make`. El resultado es `NovaSave2.nro`.
 
-La versión incluida se compiló con Ounce Devkit 20261117, libounce `39406be1f25a`, devkitA64 GCC 16.1.0 y switch-tools 1.13.1. Se comprobó el respaldo y la restauración del formato en Linux, incluidas partidas vacías, archivos dañados, rutas inválidas, carpetas renombradas, respaldos de otro usuario o título, copias modificadas y datos NACP comprimidos. La prueba del menú y del acceso a partidas en una Switch 2 física sigue pendiente.
+La versión incluida se compiló con Ounce Devkit 20261117, libounce `39406be1f25a`, devkitA64 GCC 16.1.0 y switch-tools 1.13.1. El método por tramos se probó con una simulación del servicio de archivos que impone el límite de 768 caracteres (rutas de hasta 1360 caracteres, restauración normal y por etapas). Se comprobó el respaldo y la restauración del formato en Linux, incluidas partidas vacías, archivos dañados, rutas inválidas, carpetas renombradas, respaldos de otro usuario o título, copias modificadas y datos NACP comprimidos. La prueba del menú y del acceso a partidas en una Switch 2 física sigue pendiente.
 
 [Formato NACP](https://switchbrew.org/wiki/NACP_Format) · [Catálogo de IDs](https://switchbrew.org/wiki/Switch_2:Title_list/Games) · [Ounce Devkit](https://github.com/ouncebrew/ounce-devkit) · [libounce](https://github.com/ouncebrew/libounce)
