@@ -16,7 +16,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Instalar switch-zlib
-        run: dkp-pacman -Sy --noconfirm --needed switch-zlib
+        run: |
+          if dkp-pacman -Q switch-zlib; then exit 0; fi
+          for i in 1 2 3 4 5; do
+            dkp-pacman -Sy --noconfirm --needed switch-zlib && exit 0
+            echo "Reintento $i"; sleep 20
+          done
+          exit 1
 
       - name: Instalar Ounce Devkit 20261117
         run: |
