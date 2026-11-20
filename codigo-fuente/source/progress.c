@@ -38,6 +38,7 @@ void progress_title(const char *title)
     snprintf(state.title, sizeof state.title, "%s", title);
 }
 
+#ifdef __SWITCH2__
 static void format_size(char *out, size_t capacity, uint64_t bytes)
 {
     if (bytes < 1024)
@@ -60,7 +61,6 @@ static void format_time(char *out, size_t capacity, uint64_t ms)
         snprintf(out, capacity, "%02" PRIu64 ":%02" PRIu64, seconds / 60, seconds % 60);
 }
 
-#ifdef __SWITCH2__
 static void draw(void)
 {
     uint64_t elapsed = now_ms() - state.started_ms;

@@ -1,4 +1,4 @@
-# NovaSave2 0.4.15 para Nintendo Switch 2
+# NovaSave2 0.4.16 para Nintendo Switch 2
 
 Homebrew nativo para crear, verificar y restaurar copias locales de partidas de usuario. La app usa libounce y Ounce Devkit.
 
@@ -15,6 +15,28 @@ El ejecutable va en `switch/NovaSave2/NovaSave2.nro`. Los nuevos respaldos se gu
 La lista muestra el nombre del archivo que está en la microSD. Al resaltarlo, aparece el nombre completo con su extensión y el nombre de la carpeta de primer nivel. Puedes copiar un respaldo `.nsv2` desde la PC a `switch/NovaSave2/backups/` o a una carpeta de juego dentro de esa ruta. NovaSave2 encuentra también las copias de la versión anterior y sigue reconociendo los archivos si les cambias el nombre o los mueves dentro de `backups`. La partida se restaura desde el archivo seleccionado de la microSD. La lista agrupa los archivos por juego. Cada `.nsv2` conserva el identificador del perfil de origen y se verifica con esa identidad antes de escribir en el perfil de destino.
 
 Si aparecen varios perfiles con el mismo nombre, el sufijo del ID permite distinguirlos. Si el menú muestra un código hexadecimal, anótalo junto con el mensaje.
+
+## Respaldos de Switch 1, JKSV, Checkpoint y ZIP
+
+En **X Respaldos** también aparecen las partidas guardadas con otras herramientas, junto a las de NovaSave2:
+
+- **JKSV:** carpetas y `.zip` dentro de `sdmc:/JKSV/<Nombre del juego>/`, por ejemplo `JKSV/Metroid Dread/leo - 2022.04.04 @ 14.25.02/`. El nombre del juego se compara sin mayúsculas, espacios ni símbolos, así que "Metroid™ Dread" encuentra `Metroid Dread`. También vale una carpeta con el ID del juego.
+- **Checkpoint:** carpetas dentro de `sdmc:/switch/Checkpoint/saves/0x<ID> <Nombre>/`.
+- **ZIP de NovaSave2:** archivos `.zip` en la carpeta del juego, dentro de `backups/`.
+
+Cada entrada lleva su etiqueta: **[JKSV]**, **[JKSV ZIP]**, **[CHECKPOINT]**, **[ZIP]**, **[CARPETA]** o **[EDITADOS]**. Todas se restauran con **A**. Antes de escribir, la app las convierte en un NSV2 verificado (`-importado.nsv2`) y guarda una copia previa del perfil de destino, igual que con cualquier respaldo.
+
+Conversiones disponibles:
+
+| Desde | A NSV2 | A carpeta | A ZIP |
+|---|---|---|---|
+| NSV2 | — | **Y** Desempaquetar | **R** Empaquetar ZIP |
+| Carpeta (JKSV, Checkpoint, editados) | **ZR** Guardar como NSV2 | — | **R** Empaquetar ZIP |
+| ZIP (JKSV o NovaSave2) | **ZR** Guardar como NSV2 | **Y** Desempaquetar | — |
+
+Los ZIP se crean en la carpeta del juego, con los archivos de la partida en la raíz como los de JKSV. Se comprueban después de escribirlos y se abren en la PC con cualquier programa ZIP. No se admiten ZIP con contraseña ni de más de 2 GB. **X Borrar** solo borra archivos de NovaSave2; los de JKSV y Checkpoint no se tocan.
+
+Para usar un respaldo `.rar` de la PC, descomprímelo primero y copia la carpeta del juego a `sdmc:/JKSV/`.
 
 ## Pantalla y progreso
 

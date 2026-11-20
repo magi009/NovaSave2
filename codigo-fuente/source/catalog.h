@@ -12,9 +12,22 @@ typedef struct {
     char folder[GameFolderSize];
     SaveIdentity source;
     bool modified;
-    bool raw_folder;
+    bool raw_folder;        /* carpeta con archivos sueltos */
+    bool zip;               /* ZIP con la partida en la raiz (JKSV o NovaSave2) */
+    bool deletable;         /* archivo propio de NovaSave2 */
+    char tag[16];           /* EDITADOS, CARPETA, JKSV, CHECKPOINT, ZIP... */
 } BackupEntry;
 
-bool catalog_load(const char *root, const char *imports, const char *edits, uint64_t title, BackupEntry **entries, size_t *count);
+typedef struct {
+    const char *root;          /* sdmc:/switch/NovaSave2/backups */
+    const char *imports;       /* .../importar/<TID> */
+    const char *edits;         /* .../editados */
+    const char *jksv;          /* sdmc:/JKSV */
+    const char *checkpoint;    /* sdmc:/switch/Checkpoint/saves */
+    const char *title_name;    /* nombre del juego, para las carpetas de JKSV */
+    uint64_t title;
+} CatalogSources;
+
+bool catalog_load(const CatalogSources *sources, BackupEntry **entries, size_t *count);
 
 #endif

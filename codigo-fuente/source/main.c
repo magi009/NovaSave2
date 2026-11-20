@@ -5,6 +5,7 @@
 #include "catalog.h"
 #include "titledata.h"
 #include "progress.h"
+#include "zipio.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -20,6 +21,9 @@
 #define BACKUP_ROOT APP_ROOT "/backups"
 #define EDIT_ROOT APP_ROOT "/editados"
 #define IMPORT_ROOT APP_ROOT "/importar"
+#define TEMP_ROOT APP_ROOT "/temporal"
+#define JKSV_ROOT "sdmc:/JKSV"
+#define CHECKPOINT_ROOT "sdmc:/switch/Checkpoint/saves"
 #define SAVE_ROOT "novasave:/"
 
 typedef struct {
@@ -537,7 +541,11 @@ static void load_backups(const SaveEntry *save)
     backup_index = 0;
     char imports[120];
     snprintf(imports, sizeof imports, IMPORT_ROOT "/%016" PRIX64, save->id.title);
-    bool complete = catalog_load(BACKUP_ROOT, imports, EDIT_ROOT, save->id.title, &backups, &backup_count);
+    CatalogSources sources = {
+        .root = BACKUP_ROOT, .imports = imports, .edits = EDIT_ROOT, .jksv = JKSV_ROOT,
+        .checkpoint = CHECKPOINT_ROOT, .title_name = save->title, .title = save->id.title,
+    };
+    bool complete = catalog_load(&sources, &backups, &backup_count);
     if (!complete)
         report("Lectura incompleta de respaldos en microSD.");
     else if (!backup_count) {
@@ -698,7 +706,9 @@ static bool make_export_folder(char *out, size_t capacity, const BackupEntry *ba
         return false;
 
     char name[49];
-    copy_label(name, sizeof name, backup->name, strlen(backup->name) - 5);
+    const char *dot = strrchr(backup->name, '.');
+    size_t base = dot && dot != backup->name ? (size_t)(dot - backup->name) : strlen(backup->name);
+    copy_label(name, sizeof name, backup->name, base);
     for (char *p = name; *p; p++)
         if (strchr("<>:\"/\\|?*", *p))
             *p = '_';
@@ -757,20 +767,169 @@ static void delete_backup(void)
     report("Respaldo borrado de la microSD.");
 }
 
-static FILE *stage_import(const SaveEntry *save, BackupEntry *backup)
+/* ---- ZIP y carpetas temporales ------------------------------------------ */
+
+static bool make_temp_folder(char *out, size_t capacity)
+{
+    if (!ensure_dir(APP_ROOT) || !ensure_dir(TEMP_ROOT))
+        return false;
+    for (unsigned n = 1; n <= 999; n++) {
+        if (snprintf(out, capacity, TEMP_ROOT "/tramo-%03u", n) >= (int)capacity)
+            return false;
+        if (mkdir(out, 0700) == 0)
+            return true;
+        if (errno != EEXIST)
+            return false;
+    }
+    return false;
+}
+
+static void remove_temp_folder(const char *folder)
 {
     char root[BackupPathSize + 2];
-    snprintf(root, sizeof root, "%s/", backup->path);
-    backup_log_event("PREPARAR CARPETA IMPORTADA ruta=%s", root);
-    if (!ensure_backup_folder(save) ||
-        !new_backup_path(backup->path, sizeof backup->path, save, "-importado"))
-        return NULL;
-    if (!archive_backup_modified(root, backup->path, save->id)) {
-        report_archive_failure();
-        return NULL;
+    snprintf(root, sizeof root, "%s/", folder);
+    if (archive_clear(root))
+        rmdir(folder);
+    rmdir(TEMP_ROOT);
+}
+
+static void report_zip_failure(const char *what)
+{
+    report("%s", what);
+    snprintf(detail, sizeof detail, "%.200s", zip_error());
+}
+
+/* Extrae un ZIP a una carpeta temporal; root queda con "/" al final. */
+static bool extract_zip_temp(const BackupEntry *backup, char *folder, size_t folder_size,
+                             char *root, size_t root_size)
+{
+    if (!make_temp_folder(folder, folder_size)) {
+        report("No se pudo crear una carpeta temporal en la microSD.");
+        return false;
     }
-    backup->source = save->id;
-    return open_verified(backup);
+    snprintf(root, root_size, "%s/", folder);
+    progress_title("Abriendo el ZIP");
+    if (!zip_extract(backup->path, root)) {
+        report_zip_failure("No se pudo abrir el ZIP.");
+        remove_temp_folder(folder);
+        return false;
+    }
+    return true;
+}
+
+static bool new_zip_path(char *out, size_t capacity, const SaveEntry *save)
+{
+    const time_t now = time(NULL);
+    struct tm date;
+    char timestamp[32] = "sin-fecha";
+    if (localtime_r(&now, &date))
+        strftime(timestamp, sizeof timestamp, "%Y%m%d-%H%M%S", &date);
+    char folder[192], partial[BackupPathSize];
+    save_folder(folder, sizeof folder, save);
+    for (unsigned i = 0; i < 1000; i++) {
+        int n = snprintf(out, capacity, "%s/%s-%03u.zip", folder, timestamp, i);
+        if (n < 0 || (size_t)n >= capacity)
+            return false;
+        snprintf(partial, sizeof partial, "%s.partial", out);
+        int final_state = available_name(out), partial_state = available_name(partial);
+        if (final_state < 0 || partial_state < 0)
+            return false;
+        if (final_state > 0 && partial_state > 0)
+            return true;
+    }
+    report("No se encontro un nombre libre para el ZIP.");
+    return false;
+}
+
+/* Empaqueta en ZIP (como JKSV) un NSV2 o una carpeta de partida. */
+static void pack_zip(const SaveEntry *save, const BackupEntry *backup)
+{
+    char zip_path[BackupPathSize], temp[160] = "", root[BackupPathSize + 2];
+    if (!ensure_backup_folder(save) || !new_zip_path(zip_path, sizeof zip_path, save))
+        return;
+    if (backup->raw_folder) {
+        snprintf(root, sizeof root, "%s/", backup->path);
+    } else {
+        FILE *file = open_verified(backup);
+        if (!file)
+            return;
+        bool ok = make_temp_folder(temp, sizeof temp);
+        if (ok) {
+            snprintf(root, sizeof root, "%s/", temp);
+            progress_title("Sacando los archivos del NSV2");
+            ok = archive_read(file, backup->source, root);
+        }
+        fclose(file);
+        if (!ok) {
+            if (temp[0])
+                remove_temp_folder(temp);
+            report("No se pudieron sacar los archivos del NSV2.");
+            return;
+        }
+    }
+    progress_title("Creando el ZIP");
+    bool ok = zip_create(root, zip_path);
+    if (temp[0])
+        remove_temp_folder(temp);
+    if (!ok) {
+        report_zip_failure("No se pudo crear el ZIP.");
+        return;
+    }
+    select_created(zip_path);
+    report("ZIP creado y verificado. Se abre en la PC o en JKSV.");
+    snprintf(detail, sizeof detail, "%.245s", zip_path + strlen("sdmc:/"));
+}
+
+static bool make_export_folder(char *out, size_t capacity, const BackupEntry *backup);
+
+/* Saca los archivos de un ZIP a editados/ para verlos o cambiarlos. */
+static void export_zip(const BackupEntry *backup)
+{
+    char folder[192], root[200];
+    if (!make_export_folder(folder, sizeof folder, backup)) {
+        report("No se pudo crear la carpeta de salida en la microSD.");
+        return;
+    }
+    snprintf(root, sizeof root, "%s/", folder);
+    progress_title("Desempaquetando el ZIP");
+    if (!zip_extract(backup->path, root)) {
+        if (archive_clear(root))
+            rmdir(folder);
+        report_zip_failure("No se pudieron extraer todos los archivos del ZIP.");
+        return;
+    }
+    select_created(folder);
+    report("Desempaquetado: archivos sueltos en la microSD.");
+    snprintf(detail, sizeof detail, "%s", folder + strlen("sdmc:/"));
+}
+
+static FILE *stage_import(const SaveEntry *save, BackupEntry *backup)
+{
+    char root[BackupPathSize + 2], temp[160] = "";
+    if (backup->zip) {
+        if (!extract_zip_temp(backup, temp, sizeof temp, root, sizeof root))
+            return NULL;
+    } else {
+        snprintf(root, sizeof root, "%s/", backup->path);
+    }
+    FILE *staged = NULL;
+    BackupEntry original = *backup;
+    backup_log_event("PREPARAR %s IMPORTADO ruta=%s", original.zip ? "ZIP" : "CARPETA", original.path);
+    progress_title("Empaquetando la partida importada");
+    if (ensure_backup_folder(save) &&
+        new_backup_path(backup->path, sizeof backup->path, save, "-importado")) {
+        if (archive_backup_modified(root, backup->path, save->id)) {
+            backup->source = save->id;
+            backup->zip = backup->raw_folder = false;
+            backup->modified = true;
+            staged = open_verified(backup);
+        } else {
+            report_archive_failure();
+        }
+    }
+    if (temp[0])
+        remove_temp_folder(temp);
+    return staged;
 }
 
 static void prepare_for_profile(const SaveEntry *save, const BackupEntry *backup)
@@ -781,7 +940,14 @@ static void prepare_for_profile(const SaveEntry *save, const BackupEntry *backup
     if (!ensure_backup_folder(save) || !new_backup_path(path, sizeof path, save, "-perfil"))
         return;
     bool ok;
-    if (backup->raw_folder) {
+    if (backup->zip) {
+        char temp[160], root[BackupPathSize + 2];
+        if (!extract_zip_temp(backup, temp, sizeof temp, root, sizeof root))
+            return;
+        progress_title("Empaquetando el ZIP como NSV2");
+        ok = archive_backup_modified(root, path, save->id);
+        remove_temp_folder(temp);
+    } else if (backup->raw_folder) {
         char root[BackupPathSize + 2];
         snprintf(root, sizeof root, "%s/", backup->path);
         backup_log_event("PREPARAR CARPETA EDITADA ruta=%s", root);
@@ -1034,7 +1200,7 @@ static void restore_backup(const TargetProfile *profile, const BackupEntry *sele
         return;
     }
     BackupEntry backup = *selected;
-    FILE *input = backup.raw_folder ? stage_import(save, &backup) : open_verified(&backup);
+    FILE *input = backup.raw_folder || backup.zip ? stage_import(save, &backup) : open_verified(&backup);
     if (!input)
         return;
     Result result = fsdevMountSaveData("novasave", save->id.title, save->uid);
@@ -1111,12 +1277,12 @@ static void draw_backups(void)
         char label[BackupNameSize];
         const BackupEntry *entry = &backups[i];
         copy_label(label, sizeof label, entry->name, strlen(entry->name));
-        const char *tag = "";
-        if (entry->raw_folder)
-            tag = !strcmp(entry->folder, "editados") ? "[EDITADOS]" : "[CARPETA]";
+        char tag[24] = "";
+        if (entry->tag[0])
+            snprintf(tag, sizeof tag, "[%s]", entry->tag);
         else if (entry->modified)
-            tag = "[MODIFICADO]";
-        ui_row(i == backup_index, "%-58.58s %s", label, tag);
+            snprintf(tag, sizeof tag, "[MODIFICADO]");
+        ui_row(i == backup_index, "%-56.56s %s", label, tag);
     }
     if (backup_count) {
         char selected[BackupNameSize];
@@ -1150,7 +1316,8 @@ static void draw_backups(void)
         const SaveEntry *target = &profiles[profile_index].save;
         printf("  Destino: " UI_ACCENT "%.36s" UI_RESET "  ...%08" PRIX32 "%s\n", target->profile,
                (uint32_t)target->id.user_low, pending == StagedRestoreAction ? "   [por etapas]" : "");
-        if (backups[backup_index].raw_folder || !same_user(target->id, backups[backup_index].source))
+        if (backups[backup_index].raw_folder || backups[backup_index].zip ||
+            !same_user(target->id, backups[backup_index].source))
             printf("  " UI_WARN "El juego podria rechazar datos importados o de otro perfil." UI_RESET "\n");
         if (backups[backup_index].modified)
             printf("  " UI_DANGER "Respaldo modificado: el juego podria rechazarlo o perder progreso." UI_RESET "\n");
@@ -1169,13 +1336,26 @@ static void draw_backups(void)
     } else if (backup_count && backups[backup_index].raw_folder) {
         printf("  ");
         ui_key("A", "Restaurar carpeta");
-        ui_key("ZR", "Guardar copia NSV2");
+        ui_key("ZR", "Guardar como NSV2");
+        ui_key("R", "Empaquetar ZIP");
+        printf("\n\n  ");
+        ui_key("B", "Volver");
+        printf("\n");
+    } else if (backup_count && backups[backup_index].zip) {
+        printf("  ");
+        ui_key("A", "Restaurar ZIP");
+        ui_key("Y", "Desempaquetar");
+        ui_key("ZR", "Guardar como NSV2");
+        printf("\n\n  ");
+        if (backups[backup_index].deletable)
+            ui_key("X", "Borrar");
         ui_key("B", "Volver");
         printf("\n");
     } else if (backup_count) {
         printf("  ");
         ui_key("A", "Restaurar");
         ui_key("Y", "Desempaquetar");
+        ui_key("R", "Empaquetar ZIP");
         ui_key("ZR", "Copia para perfil");
         printf("\n\n  ");
         ui_key("X", "Borrar");
@@ -1364,11 +1544,11 @@ int main(void)
             } else if (backup_count && (keys & (HidNpadButton_A | HidNpadButton_ZR))) {
                 const BackupEntry *backup = &backups[backup_index];
                 FILE *check = NULL;
-                if (!backup->raw_folder) {
+                if (!backup->raw_folder && !backup->zip) {
                     show_message("Comprobando el archivo...");
                     check = open_verified(backup);
                 }
-                if (check || backup->raw_folder) {
+                if (check || backup->raw_folder || backup->zip) {
                     if (check)
                         fclose(check);
                     preparing_profile = (keys & HidNpadButton_ZR) != 0;
@@ -1377,9 +1557,19 @@ int main(void)
                     report(preparing_profile ? "Elige el perfil para la nueva copia NSV2." :
                                               "Elige donde se escribira la partida.");
                 }
-            } else if (backup_count && !backups[backup_index].raw_folder &&
+            } else if (backup_count && backups[backup_index].deletable &&
                        (keys & HidNpadButton_X)) {
                 pending = DeleteAction;
+            } else if (backup_count && backups[backup_index].zip && (keys & HidNpadButton_Y)) {
+                show_message("Extrayendo los archivos del ZIP...");
+                backup_log_start(APP_ROOT, "desempaquetar ZIP", backups[backup_index].source.title);
+                export_zip(&backups[backup_index]);
+                finish_backup_log();
+            } else if (backup_count && !backups[backup_index].zip && (keys & HidNpadButton_R)) {
+                show_message("Creando el ZIP...");
+                backup_log_start(APP_ROOT, "empaquetar ZIP", saves[save_index].id.title);
+                pack_zip(&saves[save_index], &backups[backup_index]);
+                finish_backup_log();
             } else if (backup_count && !backups[backup_index].raw_folder &&
                        (keys & HidNpadButton_Y)) {
                 show_message("Extrayendo los archivos del respaldo...");
