@@ -2,7 +2,11 @@ name: Compilar NovaSave2
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -33,3 +37,17 @@ jobs:
         with:
           name: NovaSave2-0.4.13
           path: codigo-fuente/NovaSave2.nro
+
+      - name: Publicar el .nro en la rama compilado
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir /tmp/out
+          cp codigo-fuente/NovaSave2.nro /tmp/out/
+          (cd /tmp/out && sha256sum NovaSave2.nro > NovaSave2.nro.sha256)
+          cd /tmp/out
+          git init -q -b compilado
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "NovaSave2.nro de ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" compilado
